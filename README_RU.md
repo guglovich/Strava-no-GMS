@@ -1,6 +1,6 @@
 # Strava-no-GMS
 
-🇬🇧 [Read in English](README.md)
+[Read in English](README.md)
 
 Модифицированная версия Strava с вырезанными GMS-зависимостями — приложение запускается и позволяет авторизоваться без Google Mobile Services.
 
