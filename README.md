@@ -2,7 +2,7 @@
 
 Modified version of Strava with GMS dependencies removed — allowing the app to launch and authenticate without Google Mobile Services.
 
-🇷🇺 [Читать на русском](README_RU.md)
+[Читать на русском](README_RU.md)
 
 ---
 
