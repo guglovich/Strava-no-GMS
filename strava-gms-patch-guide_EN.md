@@ -235,6 +235,94 @@ adb install final.apk
 
 ---
 
+## Mod Anti-Tamper Check (v486 and newer)
+
+> **Symptom:** the app "flickers" — it opens and immediately closes in a loop, roughly every 1–2 seconds.
+> **Not** caused by the GMS patch: on a device with working GMS, `isGooglePlayServicesAvailable` already returns 0, so forcing 0 over 0 changes nothing.
+
+### What happened in v486
+
+The mod base added a hidden integrity check, disguised as a theme setup method:
+
+- `com/strava/view/bottomnavigation/BottomNavigationActivity.smali` → method `setupThemeConfiguration(Landroid/content/Context;)V`
+- Called as the **first line of `onCreate`** of the main screen
+- Opens its own APK (`getPackageCodePath()` → `ZipFile`) and compares entry sizes against hardcoded constants:
+  - `resources.arsc` must be `0xcb4408` (13 310 984 bytes)
+  - `classes7.dex` must be `0x998a1c` (10 064 924 bytes)
+- Any mismatch / missing entry / exception → `System.exit(0)` → process dies "cleanly"
+
+An apktool rebuild always changes these sizes, so every repatched build triggers the check. v478 had no such check — that's why it worked.
+
+### Diagnosing (adb logcat)
+
+```bash
+adb logcat | grep -iE "strava|exited cleanly|has died"
+```
+
+Typical picture of a tamper exit (crash-loop):
+
+```
+I/Zygote: Process 14360 exited cleanly (0)
+I/ActivityManager: Process com.strava (pid 14360) has died: fg TOP
+```
+
+- `exited cleanly (0)` + **empty** crash buffer (`adb logcat -b crash -d`) = the app calls `exit()` on itself — it is NOT a crash
+- A real crash shows `FATAL EXCEPTION` with a stack trace, and `am_crash` fires in the events buffer
+
+### Finding the check in a new version
+
+Location and method name will change between mod versions. Search the decoded smali:
+
+```bash
+grep -rln "Ljava/lang/System;->exit" smali*          # who can kill the app
+grep -rln "getPackageCodePath" smali*                # self-APK readers
+grep -rln '"resources.arsc"\|"classes7.dex"' smali*  # size-check victims
+grep -rln "killProcess\|Runtime;->halt" smali*       # other kill switches
+```
+
+Ignore benign hits: an `UncaughtExceptionHandler` exiting after a crash report, path-logging helpers, SDK certificate reads (`SigningInfo`). The tamper check = self-APK reading + entry size comparison + `exit`.
+
+Then find the caller — in v486 it sits at the top of `onCreate`:
+
+```bash
+grep -rn "setupThemeConfiguration" smali_classes7/com/strava/view/bottomnavigation/BottomNavigationActivity.smali
+```
+
+### Fix
+
+Replace the whole check method body with an empty stub — the method contains nothing but the check, the "theme" name is a decoy:
+
+```python
+# fix_tamper_check.py — run with: python3 -I fix_tamper_check.py
+import re
+p = "strava486_decoded/smali_classes7/com/strava/view/bottomnavigation/BottomNavigationActivity.smali"
+src = open(p, encoding="utf-8").read()
+pat = re.compile(r'\.method public static setupThemeConfiguration\(Landroid/content/Context;\)V.*?\.end method', re.S)
+stub = """.method public static setupThemeConfiguration(Landroid/content/Context;)V
+    .locals 0
+
+    return-void
+.end method"""
+src, n = pat.subn(stub, src, count=1)
+assert n == 1
+assert "0xcb4408" not in src   # make sure the constants are gone
+open(p, "w", encoding="utf-8").write(src)
+```
+
+Then build → zipalign → apksigner as usual.
+
+### Verify
+
+```bash
+adb install -r final.apk
+adb shell am start -n com.strava/com.strava.SplashActivity
+sleep 12 && adb shell pidof com.strava   # same pid after 12 s = fixed
+```
+
+> **Rule of thumb:** if a repatched mod exits "cleanly" at startup with no Java crash — look for an anti-tamper size/signature check first. Mod makers add these to fight re-signed rebuilds, and each new mod version may hide it in a different class.
+
+---
+
 ## Troubleshooting Common Errors
 
 | Error | Cause | Fix |
@@ -244,6 +332,7 @@ adb install final.apk
 | `There was a problem parsing the package` | APK corrupted during build | Rebuild, check apktool errors |
 | `const/4` inserted before `move-result` | Wrong line number in sed | Delete with `sed -i 'Nd'`, repeat grep |
 | Auth code "expired" immediately | Issue with the mod itself, not GMS | Use a different mod version |
+| App opens and closes in a loop / screen "flickers", `exited cleanly (0)` in logcat | Mod anti-tamper size check (added in v486) | Neutralize the check — see "Mod Anti-Tamper Check" section |
 
 ---
 
@@ -255,6 +344,26 @@ When authorizing via WireGuard on a VPS — make sure the VPS is not in a datace
 
 ---
 
+## GitHub Release Rules
+
+- Upload **only the patched APK** — no source files, no extra artifacts
+- Release notes **must be in English only** (no Russian or other languages)
+- Name the asset after the original APK with a `_noGMS` suffix, e.g. `Strava+v478.10+(12399348)+arm64-v8a_noGMS.apk`
+- If the build targets a specific architecture (e.g. arm64-v8a), state it in the notes and the release title
+
+Example:
+
+```bash
+gh release create 478.10 "Strava+v478.10+(12399348)+arm64-v8a_noGMS.apk" \
+  --repo guglovich/Strava-no-GMS \
+  --title "478.10 (arm64-v8a)" \
+  --notes "Strava v478.10 ReVanced — GMS patched
+
+Architecture: arm64-v8a — for 64-bit Android smartphones only."
+```
+
+---
+
 ## Quick Checklist
 
 - [ ] Test login in the mod BEFORE patching
@@ -262,6 +371,7 @@ When authorizing via WireGuard on a VPS — make sure the VPS is not in a datace
 - [ ] grep across all smali* folders
 - [ ] Exclude facebook/branch/gms/mapbox/recaptcha
 - [ ] For each file: find move-result, insert const/4, verify
+- [ ] Check for anti-tamper checks (`System.exit` / `getPackageCodePath` / entry-size comparison) — v486+ mods have them
 - [ ] Build with `apktool b`
 - [ ] zipalign → apksigner (in this exact order)
 - [ ] adb install
