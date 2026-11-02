@@ -235,6 +235,94 @@ adb install final.apk
 
 ---
 
+## Анти-тампер мода (v486 и новее)
+
+> **Симптом:** приложение «мигает» — открывается и сразу закрывается по кругу, примерно раз в 1–2 секунды.
+> **Это не** GMS-патч: на устройстве с работающим GMS `isGooglePlayServicesAvailable` и так возвращает 0, так что запись 0 поверх 0 ничего не меняет.
+
+### Что случилось в v486
+
+В мод-базу добавили скрытую проверку целостности, замаскированную под настройку темы:
+
+- `com/strava/view/bottomnavigation/BottomNavigationActivity.smali` → метод `setupThemeConfiguration(Landroid/content/Context;)V`
+- Вызывается **первой строкой `onCreate`** главного экрана
+- Открывает собственный APK (`getPackageCodePath()` → `ZipFile`) и сверяет размеры секций с захардкоженными константами:
+  - `resources.arsc` должна быть `0xcb4408` (13 310 984 байта)
+  - `classes7.dex` должна быть `0x998a1c` (10 064 924 байта)
+- Любое несовпадение / отсутствие секции / исключение → `System.exit(0)` → процесс «чисто» умирает
+
+Пересборка через apktool всегда меняет эти размеры, поэтому любой перепатченный билд триггерит проверку. В v478 такой проверки не было — поэтому он и работал.
+
+### Диагностика (adb logcat)
+
+```bash
+adb logcat | grep -iE "strava|exited cleanly|has died"
+```
+
+Типичная картина тампер-выхода (краш-луп):
+
+```
+I/Zygote: Process 14360 exited cleanly (0)
+I/ActivityManager: Process com.strava (pid 14360) has died: fg TOP
+```
+
+- `exited cleanly (0)` + **пустой** crash-буфер (`adb logcat -b crash -d`) = приложение само вызывает `exit()` — это НЕ краш
+- Настоящий краш показывает `FATAL EXCEPTION` со стек-трейсом, и в events-буфере срабатывает `am_crash`
+
+### Поиск проверки в новой версии
+
+Расположение и имя метода будут меняться между версиями мода. Ищи в декодированном smali:
+
+```bash
+grep -rln "Ljava/lang/System;->exit" smali*          # кто может убить приложение
+grep -rln "getPackageCodePath" smali*                # читающие собственный APK
+grep -rln '"resources.arsc"\|"classes7.dex"' smali*  # жертвы сверки размеров
+grep -rln "killProcess\|Runtime;->halt" smali*       # другие килл-свитчи
+```
+
+Игнорируй безобидные попадания: `UncaughtExceptionHandler`, выходящий после отчёта о краше, хелперы логирования путей, чтение сертификатов SDK (`SigningInfo`). Тампер-чек = чтение своего APK + сверка размеров секций + `exit`.
+
+Затем найди место вызова — в v486 оно в начале `onCreate`:
+
+```bash
+grep -rn "setupThemeConfiguration" smali_classes7/com/strava/view/bottomnavigation/BottomNavigationActivity.smali
+```
+
+### Фикс
+
+Замени всё тело метода-проверки на пустую заглушку — кроме самой проверки в методе ничего нет, «тематическое» имя это приманка:
+
+```python
+# fix_tamper_check.py — запускать: python3 -I fix_tamper_check.py
+import re
+p = "strava486_decoded/smali_classes7/com/strava/view/bottomnavigation/BottomNavigationActivity.smali"
+src = open(p, encoding="utf-8").read()
+pat = re.compile(r'\.method public static setupThemeConfiguration\(Landroid/content/Context;\)V.*?\.end method', re.S)
+stub = """.method public static setupThemeConfiguration(Landroid/content/Context;)V
+    .locals 0
+
+    return-void
+.end method"""
+src, n = pat.subn(stub, src, count=1)
+assert n == 1
+assert "0xcb4408" not in src   # убедись, что константы ушли
+open(p, "w", encoding="utf-8").write(src)
+```
+
+Дальше сборка → zipalign → apksigner как обычно.
+
+### Проверка
+
+```bash
+adb install -r final.apk
+adb shell am start -n com.strava/com.strava.SplashActivity
+sleep 12 && adb shell pidof com.strava   # тот же pid через 12 с = исправлено
+```
+
+> **Правило:** если перепатченный мод «чисто» выходит при старте без Java-краша — первым делом ищи анти-тампер сверкой размеров/подписи. Мод-мейкеры добавляют их против переподписанных пересборок, и в каждой новой версии мода он может прятаться в другом классе.
+
+---
+
 ## Диагностика типичных ошибок
 
 | Ошибка | Причина | Решение |
@@ -244,6 +332,7 @@ adb install final.apk
 | `There was a problem parsing the package` | APK повреждён при сборке | Пересобери, проверь ошибки apktool |
 | `const/4` вставился до `move-result` | Неверный номер строки в sed | Удали через `sed -i 'Nd'`, повтори grep |
 | Код авторизации "устарел" сразу | Проблема в самом моде, не в GMS | Используй другую версию мода |
+| Приложение открывается и закрывается по кругу / экран «мигает», в logcat `exited cleanly (0)` | Анти-тампер: сверка размеров секций (появился в v486) | Нейтрализуй проверку — см. раздел «Анти-тампер мода» |
 
 ---
 
@@ -262,6 +351,7 @@ Strava заблокирована через CloudFront геоблок (`403 ERR
 - [ ] grep по всем smali* папкам
 - [ ] Исключить facebook/branch/gms/mapbox/recaptcha
 - [ ] Для каждого файла: найти move-result, вставить const/4, проверить
+- [ ] Проверить наличие анти-тампера (`System.exit` / `getPackageCodePath` / сверка размеров) — в модах v486+ он есть
 - [ ] Собрать apktool b
 - [ ] zipalign → apksigner (именно в этом порядке)
 - [ ] adb install
